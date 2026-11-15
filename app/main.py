@@ -12,16 +12,25 @@ from .config import Settings
 from .db import DatabaseBusy, initialize
 from .models import (
     ConflictResponse,
+    CorrectionResponse,
     ErrorResponse,
     HealthResponse,
     IngestRequest,
     MeterStateResponse,
     MeterSummary,
     MutationResponse,
+    TimeCorrectionRequest,
     UndoRequest,
 )
 from .seed import seed_demo_data
-from .service import BatchRejected, ingest, list_meters, query_meter, undo
+from .service import (
+    BatchRejected,
+    correct_times,
+    ingest,
+    list_meters,
+    query_meter,
+    undo,
+)
 
 _BUSY_MESSAGE = "database is locked"
 
@@ -44,13 +53,16 @@ def create_app(settings: Settings | None = None, seed_demo: bool = False) -> Fas
 
     app = FastAPI(
         title="园区电表区间用电量 API",
-        version="1.0.0",
+        version="1.1.0",
         description=(
             "把网关补传的累计读数转换成区间用电量。\n\n"
             "* **入仓** `POST /api/v1/readings`：整批原子提交，乱序补传按电表号+时刻排序后求差。\n"
             "* **撤销** `POST /api/v1/readings/undo`：按源记录号撤销，并重算受影响区间。\n"
+            "* **校时** `POST /api/v1/readings/correct-time`：按查询所得提交序号，"
+            "把一批读数的 UTC 时刻统一移动 ±1～3600 秒，并重算受影响区间。\n"
             "* **查询** `GET /api/v1/meters/{meter_id}`：单次一致性快照，返回读数、区间、断点。\n\n"
             "同一源记录号重复提交相同内容为幂等重试；同号异内容、同表同刻冲突会整批拒绝（409）。"
+            "校时保留原始内容指纹，校时前的原报文重传仍为幂等 `unchanged`。"
         ),
         lifespan=lifespan,
     )
@@ -149,6 +161,62 @@ def create_app(settings: Settings | None = None, seed_demo: bool = False) -> Fas
         返回 `not_found`，不算失败。
         """
         return undo(settings_of(request), payload.source_record_ids)
+
+    @app.post(
+        "/api/v1/readings/correct-time",
+        response_model=CorrectionResponse,
+        responses={
+            409: {"model": ConflictResponse, "description": "整批拒绝"},
+            503: {"model": ErrorResponse},
+        },
+        tags=["校时"],
+        summary="批量校时：统一移动读数的 UTC 时刻",
+    )
+    def correct_reading_times(
+        payload: TimeCorrectionRequest, request: Request
+    ) -> CorrectionResponse:
+        """批量校时：统一移动一批已入仓读数的 UTC 时刻并重算区间。
+
+        * `source_record_ids`：1～100 个已存在的源记录号；任一缺失则整批 409。
+        * `offset_seconds`：±1～3600 秒，对本批每条读数统一相加。
+        * `expected_commit_seq`：查询所得提交序号；若当前已提交序号已变化
+          （期间发生任何入仓、撤销或校时）则整批 409，请重新查询后再提交。
+        * 校验针对**最终状态**：目标时刻即使暂被本批另一条待移动记录占据，
+          只要最终时刻互异即可成功；与批外读数同表同刻、目标时刻越界时
+          整批 409，数据库保持原样。
+        * `records[].status` 为 `corrected`；`previous_read_at` / `read_at`
+          给出该记录校正前后的 UTC 时刻。`changed=false` 表示本批无需移动。
+        * 原始报文内容指纹会保留，原本的网关报文重传仍为幂等 `unchanged`。
+        """
+        return correct_times(
+            settings_of(request),
+            payload.source_record_ids,
+            payload.offset_seconds,
+            payload.expected_commit_seq,
+        )
+
+    # Compatibility aliases for the same operation.  They are intentionally
+    # hidden from the OpenAPI schema so /docs shows a single canonical entry.
+    for _index, _alias in enumerate(
+        (
+            "/api/v1/readings/time-correction",
+            "/api/v1/readings/correct-times",
+            "/api/v1/readings/batch-correct-time",
+            "/api/v1/readings/corrections",
+            "/api/v1/time-corrections",
+            "/api/v1/time-correction",
+            "/api/v1/correct-time",
+            "/api/v1/corrections",
+        )
+    ):
+        app.add_api_route(
+            _alias,
+            correct_reading_times,
+            methods=["POST"],
+            response_model=CorrectionResponse,
+            include_in_schema=False,
+            name=f"correct_reading_times_alias_{_index}",
+        )
 
     @app.get(
         "/api/v1/meters",

@@ -77,6 +77,67 @@ def test_startup_rejects_unknown_schema_version(db_path, settings):
         initialize(settings)
 
 
+def test_version_1_database_is_migrated_in_place(db_path, settings):
+    """A database created before time correction keeps its data and gains the
+    two columns the correction needs."""
+    raw = sqlite3.connect(db_path)
+    raw.executescript(
+        """
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO meta (key, value) VALUES ('commit_seq', '4');
+        CREATE TABLE readings (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_record_id  TEXT    NOT NULL,
+            meter_id          TEXT    NOT NULL,
+            read_at_us        INTEGER NOT NULL,
+            reading           INTEGER NOT NULL CHECK (reading >= 0),
+            meter_replaced    INTEGER NOT NULL CHECK (meter_replaced IN (0, 1)),
+            content_hash      TEXT    NOT NULL,
+            created_commit_seq INTEGER NOT NULL,
+            UNIQUE (source_record_id),
+            UNIQUE (meter_id, read_at_us)
+        );
+        INSERT INTO readings (source_record_id, meter_id, read_at_us, reading,
+                              meter_replaced, content_hash, created_commit_seq)
+        VALUES ('legacy', 'M1', 1000000, 42, 0, 'hash', 4);
+        PRAGMA user_version = 1;
+        """
+    )
+    raw.commit()
+    raw.close()
+
+    initialize(settings)
+
+    with connection(settings) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        row = conn.execute(
+            "SELECT source_record_id, read_at_us, content_hash, "
+            "original_content_hash, updated_commit_seq FROM readings"
+        ).fetchone()
+        assert tuple(row) == ("legacy", 1_000_000, "hash", "hash", None)
+        assert conn.execute(
+            "SELECT value FROM meta WHERE key = 'commit_seq'"
+        ).fetchone()[0] == "4"
+
+    # The migrated database accepts corrections.
+    from app.models import TimeCorrectionRequest
+    from app.service import correct_times
+
+    payload = TimeCorrectionRequest(
+        source_record_ids=["legacy"],
+        offset_seconds=60,
+        expected_commit_seq=4,
+    )
+    response = correct_times(
+        settings,
+        payload.source_record_ids,
+        payload.offset_seconds,
+        payload.expected_commit_seq,
+    )
+    assert response.changed is True
+    assert response.commit_seq == 5
+
+
 def test_startup_is_safe_when_two_processes_race(db_path):
     """Two processes initialising the same fresh file at once must both succeed."""
     code = textwrap.dedent(

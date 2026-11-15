@@ -5,7 +5,13 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+)
 
 
 class ReadingIn(BaseModel):
@@ -102,9 +108,108 @@ class UndoRequest(BaseModel):
         return cleaned
 
 
+class TimeCorrectionRequest(BaseModel):
+    """Move a batch of already-ingested readings by the same UTC offset.
+
+    ``offset_seconds`` is applied to every listed reading of the batch (bounded
+    to ±1..3600 s by the schema).  ``expected_commit_seq`` is the sequence
+    number returned by the query that produced the selection; a stale value
+    (i.e. any write committed after it) rejects the whole batch.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    source_record_ids: list[str] = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description="待校时的源记录号，1～100 个",
+        validation_alias=AliasChoices("source_record_ids", "record_ids", "ids"),
+    )
+    offset_seconds: int = Field(
+        ...,
+        ge=-3600,
+        le=3600,
+        description="统一移动的秒数，+1～+3600 或 -1～-3600；0 无意义",
+        validation_alias=AliasChoices(
+            "offset_seconds",
+            "offset",
+            "time_offset_seconds",
+            "time_offset",
+            "shift_seconds",
+            "delta_seconds",
+        ),
+    )
+    expected_commit_seq: int = Field(
+        ...,
+        ge=0,
+        description="查询所得提交序号；与当前已提交序号不一致即视为过期",
+        validation_alias=AliasChoices(
+            "expected_commit_seq",
+            "commit_seq",
+            "observed_commit_seq",
+            "base_commit_seq",
+            "commit_sequence",
+            "expected_seq",
+            "base_seq",
+        ),
+    )
+
+    @field_validator("source_record_ids")
+    @classmethod
+    def _ids_not_blank(cls, values: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        for value in values:
+            value = value.strip()
+            if not value:
+                raise ValueError(
+                    "source_record_ids must not contain blank values"
+                )
+            cleaned.append(value)
+        return cleaned
+
+    @field_validator("offset_seconds")
+    @classmethod
+    def _positive_magnitude(cls, value: int) -> int:
+        if value == 0:
+            raise ValueError("offset_seconds must not be 0")
+        return value
+
+    @field_validator("offset_seconds", "expected_commit_seq", mode="before")
+    @classmethod
+    def _plain_integer(cls, value: object) -> object:
+        # Reject booleans ("true" is not a one-second offset) and fractions;
+        # accept integer literals, integral floats and digit strings, matching
+        # how readings are parsed.
+        if isinstance(value, bool):
+            raise ValueError("must be an integer, not a boolean")
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            if not value.is_integer():
+                raise ValueError("must be an integer")
+            return int(value)
+        if isinstance(value, str):
+            text = value.strip()
+            if text.lstrip("-").isdigit():
+                return int(text)
+            raise ValueError("must be an integer")
+        return value
+
+
 class RecordResult(BaseModel):
     source_record_id: str
     status: Literal["created", "unchanged", "removed", "not_found"]
+
+
+class CorrectionRecordResult(RecordResult):
+    # ``status`` is narrowed to the two outcomes a correction can produce.
+    status: Literal["corrected", "unchanged"]  # type: ignore[assignment]
+    previous_read_at: str
+    read_at: str
+    moved: bool = Field(
+        description="本次提交是否实际移动了该读数（status=corrected 时为 true）"
+    )
 
 
 class MeterSummary(BaseModel):
@@ -123,6 +228,15 @@ class MutationResponse(BaseModel):
     changed: bool
     counts: dict[str, int]
     records: list[RecordResult]
+    affected_meters: list[MeterSummary]
+
+
+class CorrectionResponse(BaseModel):
+    commit_seq: int
+    changed: bool
+    offset_seconds: int
+    counts: dict[str, int]
+    records: list[CorrectionRecordResult]
     affected_meters: list[MeterSummary]
 
 

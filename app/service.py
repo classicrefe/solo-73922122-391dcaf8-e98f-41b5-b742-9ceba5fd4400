@@ -36,6 +36,8 @@ from .db import (
 )
 from .models import (
     ConflictDetail,
+    CorrectionRecordResult,
+    CorrectionResponse,
     IntervalOut,
     MeterStateResponse,
     MeterSummary,
@@ -46,6 +48,8 @@ from .models import (
     RecordResult,
 )
 from .timeutil import (
+    MAX_EPOCH_US,
+    MIN_EPOCH_US,
     isoformat_utc,
     microseconds_to_iso,
     normalize_utc,
@@ -54,6 +58,12 @@ from .timeutil import (
 
 BREAK_METER_REPLACED = "meter_replaced"
 BREAK_COUNTER_ROLLBACK = "counter_rollback"
+
+# Temporary instants used while a time correction moves a batch out of the
+# way of its own target slots.  They lie far below MIN_EPOCH_US and therefore
+# never collide with a representable stored instant; the values are invisible
+# to readers because the whole move is one transaction.
+_PARKING_BASE = -1_000_000_000_000_000_000
 
 
 class BatchRejected(Exception):
@@ -65,18 +75,29 @@ class BatchRejected(Exception):
         self.conflicts = list(conflicts)
 
 
-def _content_hash(reading: ReadingIn) -> str:
+def _hash_content(
+    meter_id: str, read_at_us: int, reading: int, meter_replaced: bool
+) -> str:
     payload = json.dumps(
         {
-            "meter_id": reading.meter_id,
-            "read_at_us": to_microseconds(reading.read_at),
-            "reading": reading.reading,
-            "meter_replaced": bool(reading.meter_replaced),
+            "meter_id": meter_id,
+            "read_at_us": read_at_us,
+            "reading": reading,
+            "meter_replaced": bool(meter_replaced),
         },
         sort_keys=True,
         separators=(",", ":"),
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _content_hash(reading: ReadingIn) -> str:
+    return _hash_content(
+        reading.meter_id,
+        to_microseconds(reading.read_at),
+        reading.reading,
+        bool(reading.meter_replaced),
+    )
 
 
 @dataclass
@@ -104,7 +125,8 @@ def _existing_by_source(
         placeholders = ",".join("?" for _ in part)
         rows = conn.execute(
             f"SELECT id, source_record_id, meter_id, read_at_us, reading, "
-            f"meter_replaced, content_hash FROM readings "
+            f"meter_replaced, content_hash, original_content_hash "
+            f"FROM readings "
             f"WHERE source_record_id IN ({placeholders})",
             part,
         ).fetchall()
@@ -172,10 +194,21 @@ def _validate_batch(
     for source_id, prepared in by_source.items():
         stored = existing.get(source_id)
         if stored is not None:
-            if (
-                stored["content_hash"] == prepared.content_hash
-                and stored["meter_id"] == prepared.reading.meter_id
-            ):
+            # A reading that was time-corrected accepts either its current
+            # content (the corrected instant) or the content it was originally
+            # submitted with.  Retransmitting the pre-correction gateway
+            # message therefore stays an idempotent no-op and must not move
+            # the reading back.
+            same_as_stored = (
+                stored["meter_id"] == prepared.reading.meter_id
+                and stored["content_hash"] == prepared.content_hash
+            )
+            same_as_original = (
+                stored["meter_id"] == prepared.reading.meter_id
+                and stored["original_content_hash"] is not None
+                and stored["original_content_hash"] == prepared.content_hash
+            )
+            if same_as_stored or same_as_original:
                 result.unchanged.append(source_id)
             else:
                 result.conflicts.append(
@@ -355,13 +388,16 @@ def ingest(
                 conn.execute(
                     "INSERT INTO readings (source_record_id, meter_id, "
                     "read_at_us, reading, meter_replaced, content_hash, "
-                    "created_commit_seq) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "original_content_hash, created_commit_seq, "
+                    "updated_commit_seq) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)",
                     (
                         reading.source_record_id,
                         reading.meter_id,
                         prepared.read_at_us,
                         reading.reading,
                         1 if reading.meter_replaced else 0,
+                        prepared.content_hash,
                         prepared.content_hash,
                         commit_seq,
                     ),
@@ -383,6 +419,288 @@ def ingest(
                 records=records,
                 meters=meters,
             )
+
+
+def correct_times(
+    settings: Settings,
+    source_record_ids: Sequence[str],
+    offset_seconds: int,
+    expected_commit_seq: int,
+) -> CorrectionResponse:
+    """Atomically move a batch of readings by one UTC offset.
+
+    Semantics
+    ---------
+    * All listed readings move by the same ``offset_seconds``.  The batch is
+      validated as a whole against the *final* state: a target instant may be
+      occupied by another reading of the same batch, as long as that reading
+      moves away too and the final instants are unique.
+    * Rejected as a whole (409) when a listed source record is missing, the
+      expected commit sequence is stale, a moved instant leaves the supported
+      UTC range, or a final instant collides with a reading outside the batch.
+      Nothing is written on rejection.
+    * A reading whose target equals its current instant is reported as
+      ``unchanged`` (only possible if the offset is 0, which the request
+      schema rejects; kept so the service layer stays total).  If every listed
+      reading is already there, no commit is made.
+    * The original content fingerprint is preserved, so a retransmission of
+      the pre-correction gateway message stays an idempotent no-op.
+    """
+    ids = list(dict.fromkeys(source_record_ids))
+    delta_us = int(offset_seconds) * 1_000_000
+
+    with connection(settings) as conn:
+        with write_transaction(conn):
+            commit_seq = current_commit_seq(conn)
+            if expected_commit_seq != commit_seq:
+                raise BatchRejected(
+                    "提交序号已过期，整批校时被拒绝",
+                    [
+                        ConflictDetail(
+                            type="stale_commit_seq",
+                            source_record_id=None,
+                            conflicting_source_record_id=None,
+                            detail=(
+                                f"请求基于提交序号 {expected_commit_seq}，"
+                                f"当前已提交序号为 {commit_seq}；"
+                                f"期间已有其他提交，请重新查询后再试"
+                            ),
+                        )
+                    ],
+                )
+
+            existing = _existing_by_source(conn, ids)
+            conflicts: list[ConflictDetail] = []
+
+            # ---- every listed record must exist ------------------------
+            for source_id in ids:
+                if source_id not in existing:
+                    conflicts.append(
+                        ConflictDetail(
+                            type="record_not_found",
+                            source_record_id=source_id,
+                            conflicting_source_record_id=None,
+                            detail=f"源记录 {source_id} 不存在，无法校时",
+                        )
+                    )
+            if conflicts:
+                raise BatchRejected("整批校时被拒绝", conflicts)
+
+            # ---- compute the final instant of every listed reading -----
+            moved: dict[str, tuple[sqlite3.Row, int]] = {}
+            for source_id in ids:
+                row = existing[source_id]
+                current_us = int(row["read_at_us"])
+                target_us = current_us + delta_us
+                if target_us < MIN_EPOCH_US or target_us > MAX_EPOCH_US:
+                    conflicts.append(
+                        ConflictDetail(
+                            type="time_out_of_range",
+                            source_record_id=source_id,
+                            conflicting_source_record_id=None,
+                            detail=(
+                                f"源记录 {source_id} 校正后时刻 "
+                                f"{_render_epoch(target_us)} 超出支持的 UTC 范围"
+                            ),
+                        )
+                    )
+                moved[source_id] = (row, target_us)
+            if conflicts:
+                raise BatchRejected("整批校时被拒绝", conflicts)
+
+            # ---- final (meter, instant) must be unique within the batch ---
+            # With a uniform offset two readings of one meter can only collide
+            # if they already shared an instant, which the unique index
+            # forbids.  The check is kept as a defensive invariant: the batch
+            # is accepted on its *final* slots, never on intermediate states.
+            final_slot_owner: dict[tuple[str, int], str] = {}
+            for source_id in ids:
+                row, target_us = moved[source_id]
+                slot = (row["meter_id"], target_us)
+                other = final_slot_owner.get(slot)
+                if other is not None:
+                    conflicts.append(
+                        ConflictDetail(
+                            type="meter_time_conflict",
+                            source_record_id=source_id,
+                            conflicting_source_record_id=other,
+                            detail=(
+                                f"电表 {row['meter_id']} 校正后两条记录落在同一时刻 "
+                                f"{_render_epoch(target_us)}"
+                            ),
+                        )
+                    )
+                else:
+                    final_slot_owner[slot] = source_id
+            if conflicts:
+                raise BatchRejected("整批校时被拒绝", conflicts)
+
+            # Readings *outside* the batch keep their instants, so a member's
+            # target slot must not be owned by one of them.  Slots currently
+            # owned by batch members are fine: those readings move away too,
+            # which is exactly the "final state" rule.
+            outside_slots = _slots_outside_batch(conn, ids)
+            for source_id in ids:
+                row, target_us = moved[source_id]
+                slot = (row["meter_id"], target_us)
+                other = outside_slots.get(slot)
+                if other is not None:
+                    conflicts.append(
+                        ConflictDetail(
+                            type="meter_time_conflict",
+                            source_record_id=source_id,
+                            conflicting_source_record_id=other,
+                            detail=(
+                                f"电表 {row['meter_id']} 校正后时刻 "
+                                f"{_render_epoch(target_us)} "
+                                f"已有批外读数 {other}"
+                            ),
+                        )
+                    )
+            if conflicts:
+                raise BatchRejected("整批校时被拒绝", conflicts)
+
+            # ---- apply ------------------------------------------------
+            changed = False
+            records: list[CorrectionRecordResult] = []
+            meters: set[str] = set()
+            # The order of UPDATEs must not trip the (meter_id, read_at_us)
+            # unique index: move every reading out of the way first, then to
+            # its final instant.  Everything happens in one transaction, so
+            # no observer ever sees the intermediate state.
+            pending = []
+            for source_id in ids:
+                row, target_us = moved[source_id]
+                current_us = int(row["read_at_us"])
+                if current_us == target_us:
+                    continue
+                pending.append((source_id, row, current_us, target_us))
+                meters.add(row["meter_id"])
+
+            if pending:
+                changed = True
+                new_commit_seq = bump_commit_seq(conn)
+                # Step 1: park the batch below MIN_EPOCH_US, where no stored
+                # instant can live, so the moves cannot trip the
+                # (meter_id, read_at_us) unique index while the batch is being
+                # rearranged.
+                for _source_id, row, _current_us, _target_us in pending:
+                    conn.execute(
+                        "UPDATE readings SET read_at_us = ? WHERE id = ?",
+                        (_PARKING_BASE - int(row["id"]), int(row["id"])),
+                    )
+                # Step 2: move each reading to its final instant.
+                try:
+                    for source_id, row, current_us, target_us in pending:
+                        conn.execute(
+                            "UPDATE readings SET read_at_us = ?, "
+                            "content_hash = ?, updated_commit_seq = ? "
+                            "WHERE id = ?",
+                            (
+                                target_us,
+                                _hash_content(
+                                    row["meter_id"],
+                                    target_us,
+                                    int(row["reading"]),
+                                    bool(row["meter_replaced"]),
+                                ),
+                                new_commit_seq,
+                                int(row["id"]),
+                            ),
+                        )
+                except sqlite3.IntegrityError as exc:
+                    # The unique index is the last line of defence; a race or
+                    # a hand-edited database must still reject the whole batch.
+                    raise BatchRejected(
+                        "整批校时被拒绝",
+                        [
+                            ConflictDetail(
+                                type="meter_time_conflict",
+                                source_record_id=None,
+                                conflicting_source_record_id=None,
+                                detail=(
+                                    "校正后的时刻与已有读数冲突，整批已回滚: "
+                                    f"{exc}"
+                                ),
+                            )
+                        ],
+                    ) from exc
+                for meter_id in sorted(meters):
+                    _recompute_intervals(conn, meter_id, new_commit_seq)
+            else:
+                new_commit_seq = commit_seq
+
+            for source_id in ids:
+                row, target_us = moved[source_id]
+                current_us = int(row["read_at_us"])
+                if current_us == target_us:
+                    status = "unchanged"
+                else:
+                    status = "corrected"
+                records.append(
+                    CorrectionRecordResult(
+                        source_record_id=source_id,
+                        status=status,
+                        previous_read_at=microseconds_to_iso(current_us),
+                        read_at=microseconds_to_iso(target_us),
+                        moved=(status == "corrected"),
+                    )
+                )
+
+            counts: dict[str, int] = defaultdict(int)
+            for record in records:
+                counts[record.status] += 1
+            summaries = [
+                _meter_summary(conn, meter_id) for meter_id in sorted(meters)
+            ]
+            return CorrectionResponse(
+                commit_seq=new_commit_seq,
+                changed=changed,
+                offset_seconds=int(offset_seconds),
+                counts=dict(counts),
+                records=records,
+                affected_meters=summaries,
+            )
+
+
+def _render_epoch(epoch_us: int) -> str:
+    try:
+        return microseconds_to_iso(epoch_us)
+    except (OverflowError, ValueError):
+        return f"epoch_us={epoch_us}"
+
+
+def _slots_outside_batch(
+    conn: sqlite3.Connection, source_ids: Sequence[str]
+) -> dict[tuple[str, int], str]:
+    """Map every (meter, instant) currently owned by a reading not in the batch."""
+    ids = list(dict.fromkeys(source_ids))
+    result: dict[tuple[str, int], str] = {}
+    chunk = 400
+    # Collect the distinct meters touched by the batch first.
+    meters: set[str] = set()
+    for start in range(0, len(ids), chunk):
+        part = ids[start : start + chunk]
+        placeholders = ",".join("?" for _ in part)
+        rows = conn.execute(
+            f"SELECT DISTINCT meter_id FROM readings "
+            f"WHERE source_record_id IN ({placeholders})",
+            part,
+        ).fetchall()
+        meters.update(row["meter_id"] for row in rows)
+    if not meters:
+        return result
+    for meter_id in meters:
+        rows = conn.execute(
+            "SELECT source_record_id, read_at_us FROM readings "
+            "WHERE meter_id = ?",
+            (meter_id,),
+        ).fetchall()
+        for row in rows:
+            if row["source_record_id"] in ids:
+                continue
+            result[(meter_id, int(row["read_at_us"]))] = row["source_record_id"]
+    return result
 
 
 def undo(
@@ -486,7 +804,11 @@ def _reading_out(row: sqlite3.Row) -> ReadingOut:
         read_at=microseconds_to_iso(row["read_at_us"]),
         reading=int(row["reading"]),
         meter_replaced=bool(row["meter_replaced"]),
-        commit_seq=int(row["created_commit_seq"]),
+        commit_seq=int(
+            row["updated_commit_seq"]
+            if row["updated_commit_seq"] is not None
+            else row["created_commit_seq"]
+        ),
     )
 
 
@@ -524,7 +846,8 @@ def query_meter(
                 params.append(to_us)
             reading_rows = conn.execute(
                 "SELECT source_record_id, read_at_us, reading, meter_replaced, "
-                f"created_commit_seq FROM readings WHERE {' AND '.join(clauses)} "
+                "created_commit_seq, updated_commit_seq "
+                f"FROM readings WHERE {' AND '.join(clauses)} "
                 "ORDER BY read_at_us ASC",
                 params,
             ).fetchall()

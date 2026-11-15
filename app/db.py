@@ -24,7 +24,7 @@ from typing import Iterator
 
 from .config import Settings
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class DatabaseBusy(RuntimeError):
@@ -44,8 +44,16 @@ CREATE TABLE IF NOT EXISTS readings (
     read_at_us        INTEGER NOT NULL,
     reading           INTEGER NOT NULL CHECK (reading >= 0),
     meter_replaced    INTEGER NOT NULL CHECK (meter_replaced IN (0, 1)),
+    -- Hash of the content as currently stored (read_at reflects corrections).
     content_hash      TEXT    NOT NULL,
+    -- Hash of the content as originally submitted.  A correction only moves
+    -- read_at_us, and keeping the original fingerprint makes a retransmission
+    -- of the pre-correction gateway message an idempotent no-op instead of a
+    -- conflict or, worse, a silent move back.
+    original_content_hash TEXT,
     created_commit_seq INTEGER NOT NULL,
+    -- Commit that last moved the reading (NULL until a correction happens).
+    updated_commit_seq INTEGER,
     UNIQUE (source_record_id),
     UNIQUE (meter_id, read_at_us)
 );
@@ -137,9 +145,36 @@ def initialize(settings: Settings) -> None:
                         "VALUES ('commit_seq', '0')"
                     )
                     user_version = conn.execute("PRAGMA user_version").fetchone()[0]
-                    if user_version not in (0, SCHEMA_VERSION):
+                    if user_version not in (0, 1, SCHEMA_VERSION):
                         raise RuntimeError(
                             f"unsupported schema version {user_version}"
+                        )
+                    if user_version in (0, 1):
+                        # v2 introduced original_content_hash and
+                        # updated_commit_seq.  A database created before the
+                        # correction feature lacks them; existing rows were
+                        # never corrected, so their current content is also
+                        # their original content.  A fresh database already
+                        # has both columns and this is a no-op.
+                        columns = {
+                            row["name"]
+                            for row in conn.execute(
+                                "PRAGMA table_info(readings)"
+                            ).fetchall()
+                        }
+                        if "original_content_hash" not in columns:
+                            conn.execute(
+                                "ALTER TABLE readings "
+                                "ADD COLUMN original_content_hash TEXT"
+                            )
+                        if "updated_commit_seq" not in columns:
+                            conn.execute(
+                                "ALTER TABLE readings "
+                                "ADD COLUMN updated_commit_seq INTEGER"
+                            )
+                        conn.execute(
+                            "UPDATE readings SET original_content_hash = "
+                            "content_hash WHERE original_content_hash IS NULL"
                         )
                     # user_version is a header value; it persists with COMMIT.
                     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")

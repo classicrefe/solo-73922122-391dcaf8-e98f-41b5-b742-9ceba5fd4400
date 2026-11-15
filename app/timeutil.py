@@ -12,6 +12,22 @@ from datetime import datetime, timedelta, timezone
 
 UTC = timezone.utc
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+_MAX_UTC = datetime(9999, 12, 31, 23, 59, 59, 999999, tzinfo=UTC)
+_MIN_UTC = datetime(1, 1, 1, tzinfo=UTC)
+
+# Supported range for stored instants: exactly the instants a Python
+# ``datetime`` can represent.  A time correction is rejected deterministically
+# when the moved instant would leave this range.
+MIN_EPOCH_US = (
+    (_MIN_UTC - _EPOCH).days * 86_400_000_000
+    + (_MIN_UTC - _EPOCH).seconds * 1_000_000
+    + (_MIN_UTC - _EPOCH).microseconds
+)
+MAX_EPOCH_US = (
+    (_MAX_UTC - _EPOCH).days * 86_400_000_000
+    + (_MAX_UTC - _EPOCH).seconds * 1_000_000
+    + (_MAX_UTC - _EPOCH).microseconds
+)
 
 
 def normalize_utc(value: datetime) -> datetime:

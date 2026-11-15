@@ -91,12 +91,149 @@ def main(base_url: str, second_url: str | None = None) -> int:
         listing = client.get("/api/v1/meters").json()
         assert any(m["meter_id"] == "E2E-M1" for m in listing)
 
+        # ---- batch time correction -----------------------------------
+        # The gateway confirmed that e2e-00/e2e-03 were 10 minutes fast.
+        seq = state["commit_seq"]
+        correction = client.post(
+            "/api/v1/readings/correct-time",
+            json={
+                "source_record_ids": ["e2e-00", "e2e-03"],
+                "offset_seconds": -600,
+                "expected_commit_seq": seq,
+            },
+        )
+        assert correction.status_code == 200, correction.text
+        corrected = correction.json()
+        assert corrected["changed"] is True
+        assert corrected["counts"] == {"corrected": 2}
+        print("time correction:", corrected["records"])
+
+        moved = client.get("/api/v1/meters/E2E-M1").json()
+        read_at = {r["source_record_id"]: r["read_at"] for r in moved["readings"]}
+        assert read_at["e2e-00"] == "2026-01-31T23:50:00Z", read_at
+        assert read_at["e2e-03"] == "2026-02-01T02:50:00Z", read_at
+        assert moved["commit_seq"] == corrected["commit_seq"]
+
+        # Re-sending the original (pre-correction) gateway message must stay
+        # an idempotent no-op and must not move the reading back.
+        retry_original = client.post(
+            "/api/v1/readings",
+            json={
+                "readings": [
+                    {
+                        "meter_id": "E2E-M1",
+                        "source_record_id": "e2e-00",
+                        "read_at": "2026-02-01T00:00:00Z",
+                        "reading": 1000,
+                    }
+                ]
+            },
+        )
+        assert retry_original.status_code == 200, retry_original.text
+        assert retry_original.json()["changed"] is False
+        assert retry_original.json()["counts"] == {"unchanged": 1}
+        still = client.get("/api/v1/meters/E2E-M1").json()
+        assert (
+            {r["source_record_id"]: r["read_at"] for r in still["readings"]}["e2e-00"]
+            == "2026-01-31T23:50:00Z"
+        )
+        print("retransmission after correction stayed idempotent")
+
+        # A stale commit sequence rejects the whole batch.
+        stale = client.post(
+            "/api/v1/readings/correct-time",
+            json={
+                "source_record_ids": ["e2e-04"],
+                "offset_seconds": 60,
+                "expected_commit_seq": seq,
+            },
+        )
+        assert stale.status_code == 409, stale.text
+        assert stale.json()["conflicts"][0]["type"] == "stale_commit_seq"
+        print("stale correction rejected:", stale.json()["conflicts"][0]["type"])
+
+        # Correcting onto an instant occupied by a reading outside the batch
+        # rejects the batch whole.
+        client.post(
+            "/api/v1/readings",
+            json={
+                "readings": [
+                    {
+                        "meter_id": "E2E-M1",
+                        "source_record_id": "e2e-05",
+                        "read_at": "2026-02-01T05:00:00Z",
+                        "reading": 100,
+                    },
+                    {
+                        "meter_id": "E2E-M1",
+                        "source_record_id": "e2e-06",
+                        "read_at": "2026-02-01T05:10:00Z",
+                        "reading": 130,
+                    },
+                ]
+            },
+        )
+        collision_seq = client.get("/api/v1/meters/E2E-M1").json()["commit_seq"]
+        collision = client.post(
+            "/api/v1/readings/correct-time",
+            json={
+                "source_record_ids": ["e2e-05"],
+                "offset_seconds": 600,
+                "expected_commit_seq": collision_seq,
+            },
+        )
+        assert collision.status_code == 409, collision.text
+        assert collision.json()["conflicts"][0]["type"] == "meter_time_conflict"
+        assert collision.json()["conflicts"][0]["conflicting_source_record_id"] == "e2e-06"
+        print("collision rejected:", collision.json()["conflicts"][0]["type"])
+
+        # A target may be occupied by another batch member that moves away in
+        # the same batch: 06:00 -> 06:10 (currently held by 06:10) while
+        # 06:10 -> 06:20.  Validation is on the final state, so this succeeds.
+        client.post(
+            "/api/v1/readings",
+            json={
+                "readings": [
+                    {
+                        "meter_id": "E2E-M1",
+                        "source_record_id": "e2e-10",
+                        "read_at": "2026-02-01T06:00:00Z",
+                        "reading": 100,
+                    },
+                    {
+                        "meter_id": "E2E-M1",
+                        "source_record_id": "e2e-11",
+                        "read_at": "2026-02-01T06:10:00Z",
+                        "reading": 130,
+                    },
+                ]
+            },
+        )
+        pair_seq = client.get("/api/v1/meters/E2E-M1").json()["commit_seq"]
+        pair = client.post(
+            "/api/v1/readings/correct-time",
+            json={
+                "source_record_ids": ["e2e-10", "e2e-11"],
+                "offset_seconds": 600,
+                "expected_commit_seq": pair_seq,
+            },
+        )
+        assert pair.status_code == 200, pair.text
+        assert pair.json()["counts"] == {"corrected": 2}
+        pair_state = client.get("/api/v1/meters/E2E-M1").json()
+        read_at = {r["source_record_id"]: r["read_at"] for r in pair_state["readings"]}
+        assert read_at["e2e-10"] == "2026-02-01T06:10:00Z", read_at
+        assert read_at["e2e-11"] == "2026-02-01T06:20:00Z", read_at
+        print("batch member moving into another member's slot ok")
+        state = pair_state
+
     # Optional: prove both processes serve the same data.
     if second_url:
         with httpx.Client(base_url=second_url, timeout=30.0) as other:
             other_state = other.get("/api/v1/meters/E2E-M1").json()
         assert other_state["commit_seq"] == state["commit_seq"]
         assert other_state["intervals"] == state["intervals"]
+        assert other_state["readings"] == state["readings"]
         print("second process sees the same snapshot:", other_state["commit_seq"])
 
     # /docs must be usable.
@@ -107,6 +244,7 @@ def main(base_url: str, second_url: str | None = None) -> int:
         paths = spec["paths"]
         assert "/api/v1/readings" in paths
         assert "/api/v1/readings/undo" in paths
+        assert "/api/v1/readings/correct-time" in paths
         assert "/api/v1/meters/{meter_id}" in paths
     print("openapi paths ok")
     return 0

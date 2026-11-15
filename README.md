@@ -13,7 +13,7 @@ docker compose up -d --build
 
 | 地址 | 用途 |
 | --- | --- |
-| <http://localhost:8000/docs> | Swagger UI / api-1（可执行入仓、撤销、查询） |
+| <http://localhost:8000/docs> | Swagger UI / api-1（可执行入仓、撤销、校时、查询） |
 | <http://localhost:8000/redoc> | ReDoc |
 | <http://localhost:8000/openapi.json> | OpenAPI 规范 |
 | <http://localhost:8002/docs> | api-2，第二个进程，同一份数据 |
@@ -94,6 +94,63 @@ python3 -m pytest                                        # 含双进程并发/�
 按源记录号删除读数并重算这些电表的**全部区间**；不存在的号码返回
 `not_found`（不算失败）；撤销后相邻读数会自动连成新的区间。
 
+### 批量校时 — `POST /api/v1/readings/correct-time`
+
+网关维修时确认一批已入仓报文的时钟整体偏移后，用这个接口纠正数仓里的采样时刻：
+
+```json
+{
+  "source_record_ids": ["gw-0001", "gw-0002"],
+  "offset_seconds": 90,
+  "expected_commit_seq": 7
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `source_record_ids` | 1～100 个已存在的源记录号；批内重复号码自动合并 |
+| `offset_seconds` | 统一移动的秒数，`+1～+3600` 或 `-1～-3600`（不接受 0） |
+| `expected_commit_seq` | 查询（`GET /api/v1/meters/{meter_id}` 或 `/health`）所得提交序号 |
+
+本批每条读数的 UTC 时刻统一加上偏移，然后重算受影响电表的全部区间
+（乱序移动会让读数换位，区间随之重建）。整批在一个事务里提交。
+
+```json
+{
+  "commit_seq": 8,
+  "changed": true,
+  "offset_seconds": 90,
+  "counts": {"corrected": 2},
+  "records": [{
+    "source_record_id": "gw-0001", "status": "corrected", "moved": true,
+    "previous_read_at": "2026-10-01T00:00:00Z",
+    "read_at": "2026-10-01T00:01:30Z"
+  }],
+  "affected_meters": [{"meter_id": "M-1001", "...": "..."}]
+}
+```
+
+`records[].previous_read_at` / `read_at` 给出校正前后的时刻；`moved` 表示本
+次提交是否实际移动了该读数。`affected_meters` 是按校正后状态重算的汇总。
+
+以下情况**整批拒绝**（409，数据库保持原样，提交序号不前进）：
+
+| `conflicts[].type` | 含义 |
+| --- | --- |
+| `stale_commit_seq` | `expected_commit_seq` 与当前已提交序号不一致（期间有入仓/撤销/校时提交） |
+| `record_not_found` | 某个源记录号不存在 |
+| `time_out_of_range` | 校正后的时刻超出可表示的 UTC 范围（`0001-01-01`～`9999-12-31`） |
+| `meter_time_conflict` | 校正后与**批外**读数同表同刻 |
+
+校验针对**最终状态**而不是中间状态：目标时刻即使当前被本批另一条即将移走的
+读数占据，只要本批最终时刻互异就应成功。实现上先把整批读数挪到临时时刻，
+再落到最终时刻，全部在同一个事务内完成，读者看不到中间态。
+
+幂等性：校时不会改动读数的原始内容指纹。网关按原样重传校时前的报文时，
+仍按“同号同内容”返回 `unchanged`，**不会把已校正的时刻改回去**，也不推进
+提交序号；携带校正后时刻的重传同样是 `unchanged`。撤销后该源记录号重新
+可用，此时提交原报文即视为全新记录。
+
 ### 查询 — `GET /api/v1/meters/{meter_id}`
 
 可选参数 `from` / `to`（ISO-8601，含端点）与 `include_intervals`。
@@ -121,8 +178,8 @@ python3 -m pytest                                        # 含双进程并发/�
 
 | 状态码 | 含义 |
 | --- | --- |
-| 409 `batch_rejected` | 整批拒绝，`conflicts[]` 说明每条冲突 |
-| 422 | 请求体/时间窗口参数不合法 |
+| 409 `batch_rejected` | 整批拒绝，`conflicts[]` 说明每条冲突（含校时） |
+| 422 | 请求体/时间窗口参数不合法（含校时的批大小、偏移量、缺提交序号） |
 | 404 `meter_not_found` | 该电表没有读数 |
 | 503 `database_busy` | 等待写锁超时，可重试（带 `Retry-After`） |
 
@@ -134,39 +191,48 @@ python3 -m pytest                                        # 含双进程并发/�
   * 后一条读数带 `meter_replaced=true`（换表）；
   * 后一条读数小于前一条（计数回退）。
   断点区间的两端读数仍会被后续正常区间使用。
-* **同号同内容重试**幂等：不写库、不推进提交序号、不重算。
+* **同号同内容重试**幂等：不写库、不推进提交序号、不重算。校时后，携带
+  原始内容或校正后内容的重传都按同内容处理。
 * **同号异内容**、**同表同刻（不同源记录号）**：整批 409 拒绝，数据库保持
   原样（校验在写入之前完成）。
+* **校时**以查询所得提交序号做乐观并发控制：序号过期即整批 409；两个进程
+  同时校正同一批时只有一个提交成功，另一个按已提交状态判定为过期。
 * 同一次请求里重复的源记录号：内容相同则合并；内容不同或同表同刻不同号则
   整批拒绝。
 * 撤销后再提交同一源记录号视为全新记录。
 
 ## 一致性、并发与故障安全
 
-* 共享库、两个进程：所有写操作在 `BEGIN IMMEDIATE` 事务里执行，SQLite 的
-  写锁把并发写串行化（`busy_timeout=30s`），不会出现 SQLite 层面互相覆盖。
+* 共享库、两个进程：所有写操作（入仓、撤销、校时）在 `BEGIN IMMEDIATE`
+  事务里执行，SQLite 的写锁把并发写串行化（`busy_timeout=30s`），不会出现
+  SQLite 层面互相覆盖。校时先校验 `expected_commit_seq` 与当前已提交序号，
+  因此并发校时/补传/撤销的胜者由**已提交状态**唯一决定。
   `(source_record_id)` 与 `(meter_id, read_at_us)` 的唯一约束在库内兜底。
 * 读数与区间在**同一个事务**内写入；每次变更后该电表的区间全部重建，
-  因此区间表始终是读数表的函数。
+  因此区间表始终是读数表的函数。校时的两段位移（先挪到临时时刻，再落到
+  最终时刻）也在该事务内完成。
 * 查询在显式读事务（WAL 快照）中执行，读数、区间、断点、`usage_total`
   同属一次已提交状态；响应里的 `commit_seq` 标识该状态。
 * 失败/重启：整笔提交在一个事务内，未提交即回滚，进程被杀不会留下半笔
-  结果；启动时校验 `user_version`，测试另跑 `PRAGMA integrity_check` 与
-  `foreign_key_check`。
+  结果（校时中途被杀同样回滚到校正前状态）；启动时校验 `user_version`，
+  并自动把 v1 库原地迁移到 v2（新增两列，旧数据原样保留），测试另跑
+  `PRAGMA integrity_check` 与 `foreign_key_check`。
 * 区间表有 `CHECK` 约束：断点区间 `usage` 必须为 `NULL`，正常区间必须有值。
 
 ## 测试
 
 ```bash
-python3 -m pytest            # 37 个用例
+python3 -m pytest            # 64 个用例
 ```
 
 * `tests/test_api.py`：区间/断点/乱序/幂等/冲突/撤销/窗口/校验。
+* `tests/test_correction.py`：批量校时的原子移动、最终状态冲突判定、批内
+  目标时刻互换、越界/缺失/过期提交序号、原报文重传幂等、失败回滚。
 * `tests/test_concurrency.py`：启动两个真实进程共享同一个 SQLite 文件，
-  并发写、并发重试、竞争冲突、持续读写一致性、进程崩溃（`os._exit`）、
-  重启后数据延续、未提交事务回滚。
+  并发写、并发重试、竞争冲突、并发校时、持续读写一致性、进程崩溃
+  （`os._exit`）、重启后数据延续、未提交事务回滚。
 * `tests/test_durability.py`：区间重建中途异常时整批回滚、提交序号不前进、
-  多进程同时初始化建库、schema 版本保护。
+  多进程同时初始化建库、schema 版本保护与 v1 → v2 迁移。
 
 验证 Compose 部署：
 

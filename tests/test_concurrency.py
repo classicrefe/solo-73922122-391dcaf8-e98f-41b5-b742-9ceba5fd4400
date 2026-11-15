@@ -337,3 +337,200 @@ def test_restart_reuses_database_and_schema(db_path, settings):
             assert_meter_consistent(body)
     finally:
         restarted.stop()
+
+
+def _correct(client, ids, offset, seq):
+    return client.post(
+        "/api/v1/readings/correct-time",
+        json={
+            "source_record_ids": ids,
+            "offset_seconds": offset,
+            "expected_commit_seq": seq,
+        },
+    )
+
+
+def test_concurrent_corrections_on_one_batch_apply_exactly_once(two_servers, settings):
+    """Both processes submit the same correction with the same observed seq."""
+    readings = [reading("M1", f"c{i}", i * 60, 100 + i) for i in range(10)]
+    with _client(two_servers[0]) as client:
+        assert client.post(
+            "/api/v1/readings", json={"readings": readings}
+        ).status_code == 200
+        seq = client.get("/api/v1/meters/M1").json()["commit_seq"]
+
+    ids = [r["source_record_id"] for r in readings]
+
+    def send(server):
+        with _client(server) as client:
+            return _correct(client, ids, 60, seq)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = [future.result() for future in [pool.submit(send, s) for s in two_servers]]
+
+    codes = sorted(r.status_code for r in results)
+    assert codes == [200, 409], [r.json() for r in results]
+    rejected = [r for r in results if r.status_code == 409][0]
+    assert rejected.json()["code"] == "batch_rejected"
+    assert rejected.json()["conflicts"][0]["type"] == "stale_commit_seq"
+
+    with _client(two_servers[1]) as client:
+        body = client.get("/api/v1/meters/M1").json()
+    expected = [at(i * 60 + 1) for i in range(10)]
+    assert [r["read_at"] for r in body["readings"]] == expected
+    # Every reading moved exactly once, so intervals still differ by 1 kWh.
+    assert [i["usage"] for i in body["intervals"]] == [1] * 9
+    assert_meter_consistent(body)
+    with connection(settings) as conn:
+        assert_db_invariants(conn, "M1")
+
+
+def test_correction_vs_ingest_conflict_is_decided_by_committed_state(
+    two_servers, settings
+):
+    """A correction and an ingest race; both use their committed pre-state."""
+    with _client(two_servers[0]) as client:
+        client.post(
+            "/api/v1/readings",
+            json={"readings": [reading("M1", "a", 0, 100)]},
+        )
+        base = client.get("/api/v1/meters/M1").json()["commit_seq"]
+
+    def correction():
+        with _client(two_servers[0]) as client:
+            return _correct(client, ["a"], 60, base)
+
+    def ingest():
+        with _client(two_servers[1]) as client:
+            return client.post(
+                "/api/v1/readings", json={"readings": [reading("M1", "b", 1, 130)]}
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = [future.result() for future in [pool.submit(correction), pool.submit(ingest)]]
+
+    codes = sorted(r.status_code for r in results)
+    # If the correction wins the lock, the ingest collides with the moved
+    # reading; if the ingest wins, the correction's sequence is stale.  Either
+    # way exactly one of them commits and the other is refused whole.
+    assert codes == [200, 409], [r.json() for r in results]
+
+    with _client(two_servers[1]) as client:
+        body = client.get("/api/v1/meters/M1").json()
+    assert_meter_consistent(body)
+    with connection(settings) as conn:
+        assert_db_invariants(conn, "M1")
+        stored = [
+            (row[0], row[1])
+            for row in conn.execute(
+                "SELECT source_record_id, read_at_us FROM readings "
+                "ORDER BY read_at_us"
+            )
+        ]
+        if len(stored) == 1:
+            # Correction won: only "a", moved to 60 s after the base instant.
+            assert stored[0][0] == "a"
+            assert body["readings"][0]["read_at"] == at(1)
+        else:
+            # Ingest won: both readings at their original instants and the
+            # correction left no trace.
+            assert [s[0] for s in stored] == ["a", "b"]
+            assert [r["read_at"] for r in body["readings"]] == [at(0), at(1)]
+
+
+def test_queries_never_see_partial_corrections(two_servers, settings):
+    """Readers always see a state where readings and intervals agree."""
+    with _client(two_servers[0]) as client:
+        for i in range(12):
+            client.post(
+                "/api/v1/readings",
+                json={
+                    "readings": [
+                        reading("M1", f"r{i}", i * 60, 100 + i * 10),
+                    ]
+                },
+            )
+
+    stop = time.monotonic() + 6
+    errors: list[str] = []
+
+    def reader():
+        with _client(two_servers[1]) as client:
+            while time.monotonic() < stop:
+                body = client.get("/api/v1/meters/M1").json()
+                try:
+                    assert_meter_consistent(body)
+                    assert_usage_matches_readings(body)
+                except AssertionError as exc:  # pragma: no cover - diagnostic
+                    errors.append(str(exc))
+                    return
+
+    def corrector(seed):
+        rng = random.Random(seed)
+        with _client(two_servers[seed % 2]) as client:
+            while time.monotonic() < stop:
+                state = client.get("/api/v1/meters/M1").json()
+                visible = [r["source_record_id"] for r in state["readings"]]
+                if not visible:
+                    continue
+                ids = visible[: min(len(visible), rng.randint(1, 4))]
+                _correct(
+                    client,
+                    ids,
+                    rng.choice([-60, -1, 1, 60, 3600, -3600]),
+                    state["commit_seq"],
+                )
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = [pool.submit(reader)]
+        futures += [pool.submit(corrector, seed) for seed in range(2)]
+        for future in futures:
+            future.result()
+
+    assert not errors, errors[0]
+    with connection(settings) as conn:
+        assert_db_invariants(conn, "M1")
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def test_crash_during_correction_leaves_original_state(db_path, settings):
+    """A killed process leaves either the full old or the full new state."""
+    initialize(settings)
+    server = Server(db_path, _free_port()).start()
+    try:
+        with _client(server) as client:
+            client.post(
+                "/api/v1/readings",
+                json={
+                    "readings": [
+                        reading("M1", "a", 0, 100),
+                        reading("M1", "b", 60, 160),
+                        reading("M1", "c", 120, 250),
+                    ]
+                },
+            )
+            seq = client.get("/api/v1/meters/M1").json()["commit_seq"]
+            server.kill()
+
+        with connection(settings) as conn:
+            assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            assert_db_invariants(conn, "M1")
+            assert conn.execute(
+                "SELECT value FROM meta WHERE key = 'commit_seq'"
+            ).fetchone()[0] == str(seq)
+
+        restarted = Server(db_path, _free_port()).start()
+        try:
+            with _client(restarted) as client:
+                resp = _correct(client, ["a", "b"], 600, seq)
+                assert resp.status_code == 200, resp.json()
+                body = client.get("/api/v1/meters/M1").json()
+                assert [r["read_at"] for r in body["readings"]] == [
+                    at(10), at(70), at(120)
+                ]
+                assert_meter_consistent(body)
+                assert_usage_matches_readings(body)
+        finally:
+            restarted.stop()
+    finally:
+        server.stop()
